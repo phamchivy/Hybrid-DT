@@ -182,8 +182,12 @@ def run_controlled_experiment(
         learnable_gate=learnable_gate,
     )
     models.append(graph_model)
+    # Reuse the exact tuned graph_model as Hybrid-DT's graph_head instead of
+    # building a second MPGraph with untuned hyperparameters: otherwise
+    # Hybrid-DT's graph component is never validated against the same grid
+    # the standalone MP-Graph row gets, an unfair comparison.
     hybrid_model = HybridDigitalTwin(
-        graph=bundle.graph,
+        graph_head=graph_model,
         ridge_alpha=25.0,
         seed=seed,
         learnable_gate=learnable_gate,
@@ -220,10 +224,12 @@ def run_controlled_experiment(
         "quick": quick,
         "learnable_gate": learnable_gate,
         "fitted_gates": {
+            # mp_graph_gate_vio is shared: Hybrid-DT reuses the exact same
+            # tuned graph_model as its graph_head (see comment above), so
+            # there is no separate "internal" gate value to report.
             "mp_graph_gate_vio": graph_model.gate_vio,
             "hybrid_dt_gate_latency": hybrid_model.gate_latency,
             "hybrid_dt_gate_violation": hybrid_model.gate_violation,
-            "hybrid_dt_internal_gate_vio": hybrid_model.graph_head.gate_vio,
         },
     }
     return save_experiment(rows, predictions, metadata, outdir)
@@ -296,8 +302,11 @@ def run_telecomts_experiment(
         seed=seed,
         learnable_gate=learnable_gate,
     )
+    # Reuse the exact tuned graph_model as Hybrid-DT's graph_head instead of
+    # building a second MPGraph with untuned hyperparameters (see comment in
+    # run_controlled_experiment for why).
     hybrid_model = HybridDigitalTwin(
-        graph=bundle.graph,
+        graph_head=graph_model,
         ridge_alpha=35.0,
         seed=seed,
         learnable_gate=learnable_gate,
@@ -342,10 +351,12 @@ def run_telecomts_experiment(
         "random features, and every model's weight initialization",
         "learnable_gate": learnable_gate,
         "fitted_gates": {
+            # mp_graph_gate_vio is shared: Hybrid-DT reuses the exact same
+            # tuned graph_model as its graph_head (see comment above), so
+            # there is no separate "internal" gate value to report.
             "mp_graph_gate_vio": graph_model.gate_vio,
             "hybrid_dt_gate_latency": hybrid_model.gate_latency,
             "hybrid_dt_gate_violation": hybrid_model.gate_violation,
-            "hybrid_dt_internal_gate_vio": hybrid_model.graph_head.gate_vio,
         },
     }
     return save_experiment(rows, predictions, metadata, outdir)

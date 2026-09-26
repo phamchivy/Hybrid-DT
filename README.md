@@ -82,8 +82,8 @@ saved below `outputs/`.
 | Experiment | Model | Latency MAE | Violation F1 |
 |---|---|---:|---:|
 | Controlled, seed 7 | MP-Graph | 1.1948 | 0.9899 |
-| Controlled, seed 7 | Hybrid-DT | 1.2572 | 0.9265 |
-| TelecomTS, seed 17 | Hybrid-DT | 0.6963 | 0.9686 |
+| Controlled, seed 7 | Hybrid-DT | 1.2542 | 0.9265 |
+| TelecomTS, seed 17 | Hybrid-DT | 0.6964 | 0.9686 |
 | TelecomTS, five seeds | Hybrid-DT | 0.7698 +/- 0.0420 | 0.9504 +/- 0.0198 |
 
 These are best-among-implemented-baseline results under the documented

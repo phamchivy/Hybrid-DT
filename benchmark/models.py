@@ -402,13 +402,32 @@ def tune_mp_graph(
         {"alpha": 8.0, "diffusion_steps": 2, "random_dim": 128, "temporal_decay": 0.86, "queue_weight": 1.0, "residual_scale": 0.50},
         {"alpha": 30.0, "diffusion_steps": 3, "random_dim": 128, "temporal_decay": 0.90, "queue_weight": 1.4, "residual_scale": 0.35},
     ]
+
+    if learnable_gate:
+        # Avoid double-dipping the validation split: fitting each candidate's
+        # gate_vio on the same rows later used to pick the winning candidate
+        # would let a config "win" partly because its gate memorized this
+        # exact split. Halve validation instead -- one half fits the gate
+        # inside fit(), the other half scores candidates for selection.
+        # (When learnable_gate is False, gate_vio stays fixed and validation
+        # is used exactly once, as before -- no split needed.)
+        n_val = len(x_val)
+        half = n_val // 2
+        x_gate, x_select = x_val[:half], x_val[half:]
+        y_lat_gate, y_lat_select = y_lat_val[:half], y_lat_val[half:]
+        y_vio_gate, y_vio_select = y_vio_val[:half], y_vio_val[half:]
+    else:
+        x_gate, x_select = x_val, x_val
+        y_lat_gate, y_lat_select = y_lat_val, y_lat_val
+        y_vio_gate, y_vio_select = y_vio_val, y_vio_val
+
     for params in grid:
         model = MPGraph(graph=graph, seed=seed, learnable_gate=learnable_gate, **params).fit(
             x_train, y_lat_train, y_vio_train,
-            x_val=x_val, y_latency_val=y_lat_val, y_violation_val=y_vio_val,
+            x_val=x_gate, y_latency_val=y_lat_gate, y_violation_val=y_vio_gate,
         )
-        pred = model.predict(x_val)
-        metrics = metric_fn(y_lat_val, pred.latency, y_vio_val, pred.violation)
+        pred = model.predict(x_select)
+        metrics = metric_fn(y_lat_select, pred.latency, y_vio_select, pred.violation)
         score = metrics["latency_mae"] - 6.0 * metrics["violation_f1"]
         if score < best_score:
             best_score = score
@@ -419,11 +438,23 @@ def tune_mp_graph(
 
 
 class HybridDigitalTwin(BaseModel):
+    """Fuses a pre-tuned MP-Graph model with Ridge-flat (latency) and
+    Temporal-MLP (violation).
+
+    graph_head must be an already-fitted MPGraph instance, normally the
+    exact same tuned model returned by tune_mp_graph() for the standalone
+    MP-Graph benchmark row. Earlier versions built a second MPGraph here
+    with hardcoded, never-tuned hyperparameters, which meant Hybrid-DT's
+    graph component was never validated against the grid the standalone
+    MP-Graph model gets -- an unfair, apples-to-oranges comparison. Reusing
+    the tuned instance fixes that and avoids doing the grid search twice.
+    """
+
     name = "hybrid_dt"
 
     def __init__(
         self,
-        graph: Dict[str, np.ndarray],
+        graph_head: "MPGraph",
         ridge_alpha: float = 35.0,
         seed: int = 17,
         learnable_gate: bool = False,
@@ -431,8 +462,8 @@ class HybridDigitalTwin(BaseModel):
         gate_violation: float = 0.15,
     ):
         # Single unified seed drives every stochastic component of this
-        # model (the graph head's random features and the violation MLP's
-        # weight init), instead of each sub-model picking its own seed.
+        # model (the violation MLP's weight init; the graph head's own seed
+        # was already fixed when it was tuned).
         self.seed = seed
         self.learnable_gate = learnable_gate
         # gate_latency (eta) blends graph_head vs. ridge latency; gate_violation
@@ -441,17 +472,7 @@ class HybridDigitalTwin(BaseModel):
         # set learnable_gate=True to fit both from training data instead.
         self.gate_latency = gate_latency
         self.gate_violation = gate_violation
-        self.graph_head = MPGraph(
-            graph=graph,
-            alpha=ridge_alpha,
-            diffusion_steps=2,
-            random_dim=0,
-            temporal_decay=0.88,
-            queue_weight=1.2,
-            residual_scale=0.65,
-            seed=seed,
-            learnable_gate=learnable_gate,
-        )
+        self.graph_head = graph_head
         self.latency_fallback = RidgeBaseline(alpha=ridge_alpha)
         self.violation_head = TemporalMLP(hidden=96, lr=0.012, epochs=180, seed=seed)
 
@@ -464,10 +485,8 @@ class HybridDigitalTwin(BaseModel):
         y_latency_val: Optional[np.ndarray] = None,
         y_violation_val: Optional[np.ndarray] = None,
     ) -> "HybridDigitalTwin":
-        self.graph_head.fit(
-            x, y_latency, y_violation,
-            x_val=x_val, y_latency_val=y_latency_val, y_violation_val=y_violation_val,
-        )
+        # graph_head arrives already fitted (and, if applicable, its own
+        # gate_vio already learned) by tune_mp_graph -- do not refit it here.
         self.latency_fallback.fit(x, y_latency, y_violation)
         self.violation_head.fit(x, y_latency, y_violation)
 

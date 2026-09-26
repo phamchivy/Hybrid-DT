@@ -9,6 +9,7 @@ import pandas as pd
 from benchmark.experiments import (
     METRIC_COLUMNS,
     PAPER_MODEL_NAMES,
+    run_controlled_experiment,
     run_telecomts_experiment,
 )
 
@@ -18,7 +19,16 @@ PAPER_SEEDS = (7, 11, 17, 23, 29)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run and aggregate the five TelecomTS splits in the paper",
+        description="Run and aggregate a five-seed robustness sweep for either "
+        "the controlled (synthetic) or the TelecomTS benchmark. A single-seed "
+        "run is redundant with this: every seed you'd run standalone is "
+        "already one of the seeds in the sweep (outputs/<outdir>/seed_<n>/).",
+    )
+    parser.add_argument(
+        "--dataset",
+        choices=["controlled", "telecomts"],
+        default="telecomts",
+        help="Which benchmark to sweep across --seeds.",
     )
     parser.add_argument(
         "--seeds",
@@ -26,20 +36,26 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=list(PAPER_SEEDS),
     )
-    parser.add_argument("--samples", type=int, default=800)
+    # controlled (synthetic) only
+    parser.add_argument("--timesteps", type=int, default=1800)
+    parser.add_argument("--window", type=int, default=12)
+    parser.add_argument("--horizon", type=int, default=3)
+    # telecomts only
+    parser.add_argument("--samples", type=int, default=3200)
     parser.add_argument("--input-len", type=int, default=96)
     parser.add_argument(
         "--cache",
         type=Path,
-        default=Path("data/telecomts_800_even.jsonl.gz"),
-    )
-    parser.add_argument(
-        "--outdir",
-        type=Path,
-        default=Path("outputs/telecomts_multiseed"),
+        default=Path("data/telecomts_3200_even.jsonl.gz"),
     )
     parser.add_argument("--download", action="store_true")
     parser.add_argument("--skip-checksum", action="store_true")
+    # shared
+    parser.add_argument(
+        "--outdir",
+        type=Path,
+        default=Path("outputs/multiseed"),
+    )
     parser.add_argument(
         "--learnable-gate",
         action="store_true",
@@ -75,16 +91,26 @@ def main() -> None:
     frames = []
     for seed in args.seeds:
         seed_dir = args.outdir / f"seed_{seed}"
-        frame = run_telecomts_experiment(
-            outdir=seed_dir,
-            cache_path=args.cache,
-            samples=args.samples,
-            input_len=args.input_len,
-            seed=seed,
-            offline=not args.download,
-            verify_snapshot=not args.skip_checksum,
-            learnable_gate=args.learnable_gate,
-        )
+        if args.dataset == "controlled":
+            frame = run_controlled_experiment(
+                outdir=seed_dir,
+                timesteps=args.timesteps,
+                window=args.window,
+                horizon=args.horizon,
+                seed=seed,
+                learnable_gate=args.learnable_gate,
+            )
+        else:
+            frame = run_telecomts_experiment(
+                outdir=seed_dir,
+                cache_path=args.cache,
+                samples=args.samples,
+                input_len=args.input_len,
+                seed=seed,
+                offline=not args.download,
+                verify_snapshot=not args.skip_checksum,
+                learnable_gate=args.learnable_gate,
+            )
         frame["seed"] = seed
         frames.append(frame)
         print(
@@ -102,9 +128,14 @@ def main() -> None:
     (args.outdir / "run.json").write_text(
         json.dumps(
             {
+                "dataset": args.dataset,
                 "seeds": args.seeds,
-                "samples": args.samples,
-                "input_len": args.input_len,
+                "samples": args.samples if args.dataset == "telecomts" else None,
+                "input_len": args.input_len if args.dataset == "telecomts" else None,
+                "timesteps": args.timesteps if args.dataset == "controlled" else None,
+                "window": args.window if args.dataset == "controlled" else None,
+                "horizon": args.horizon if args.dataset == "controlled" else None,
+                "learnable_gate": args.learnable_gate,
                 "std": "sample standard deviation (pandas ddof=1)",
             },
             indent=2,
