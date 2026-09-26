@@ -40,9 +40,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--download", action="store_true")
     parser.add_argument("--skip-checksum", action="store_true")
-
-    parser.add_argument("--transport", choices=["rows_api", "datasets"], default="rows_api")
-
+    parser.add_argument(
+        "--learnable-gate",
+        action="store_true",
+        help="Fit the fusion gates (MP-Graph internal, Hybrid-DT latency/violation) "
+        "from training data instead of using the paper's fixed weights.",
+    )
     return parser.parse_args()
 
 
@@ -80,7 +83,7 @@ def main() -> None:
             seed=seed,
             offline=not args.download,
             verify_snapshot=not args.skip_checksum,
-            transport=args.transport,
+            learnable_gate=args.learnable_gate,
         )
         frame["seed"] = seed
         frames.append(frame)

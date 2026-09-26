@@ -17,7 +17,7 @@ from benchmark.models import (
     PersistenceBaseline,
     RidgeBaseline,
     TemporalMLP,
-    tune_stwingnn,
+    tune_mp_graph,
 )
 from benchmark.telecomts import PAPER_CACHE_SHA256, load_telecomts_bundle
 
@@ -34,7 +34,7 @@ METRIC_COLUMNS = [
 
 PAPER_MODEL_NAMES = {
     "hybrid_dt": "Hybrid-DT",
-    "s_twingnn_lite": "MP-Graph",
+    "mp_graph": "MP-Graph",
     "persistence": "Persistence",
     "ridge_flat": "Ridge-flat",
     "temporal_mlp": "Temporal-MLP",
@@ -71,7 +71,11 @@ def evaluate(
         y_violation,
         pred.violation,
     )
-    row = {"model": model.name, **metrics}
+    row = {
+        "model": model.name,
+        "paper_name": PAPER_MODEL_NAMES.get(model.name, model.name),
+        **metrics,
+    }
     arrays = {
         f"{model.name}__latency": pred.latency,
         f"{model.name}__violation": pred.violation,
@@ -128,6 +132,7 @@ def run_controlled_experiment(
     horizon: int = 3,
     seed: int = 7,
     quick: bool = False,
+    learnable_gate: bool = False,
 ) -> pd.DataFrame:
     if quick:
         timesteps = min(timesteps, 650)
@@ -164,7 +169,7 @@ def run_controlled_experiment(
             seed=seed,
         ).fit(x_train, yl_train, yv_train),
     ]
-    graph_model, validation = tune_stwingnn(
+    graph_model, validation = tune_mp_graph(
         graph=bundle.graph,
         x_train=x_train,
         y_lat_train=yl_train,
@@ -173,8 +178,17 @@ def run_controlled_experiment(
         y_lat_val=yl_val,
         y_vio_val=yv_val,
         metric_fn=combined_metrics,
+        seed=seed,
+        learnable_gate=learnable_gate,
     )
     models.append(graph_model)
+    hybrid_model = HybridDigitalTwin(
+        graph=bundle.graph,
+        ridge_alpha=25.0,
+        seed=seed,
+        learnable_gate=learnable_gate,
+    ).fit(x_train, yl_train, yv_train, x_val=x_val, y_latency_val=yl_val, y_violation_val=yv_val)
+    models.append(hybrid_model)
 
     rows: list[dict] = []
     predictions: dict[str, np.ndarray] = {
@@ -193,6 +207,7 @@ def run_controlled_experiment(
 
     metadata = {
         **bundle.metadata,
+        "seed": seed,
         "experiment": "controlled_5gc",
         "n_samples": int(len(bundle.x)),
         "split": {
@@ -203,6 +218,13 @@ def run_controlled_experiment(
         },
         "graph_model_best_validation": validation,
         "quick": quick,
+        "learnable_gate": learnable_gate,
+        "fitted_gates": {
+            "mp_graph_gate_vio": graph_model.gate_vio,
+            "hybrid_dt_gate_latency": hybrid_model.gate_latency,
+            "hybrid_dt_gate_violation": hybrid_model.gate_violation,
+            "hybrid_dt_internal_gate_vio": hybrid_model.graph_head.gate_vio,
+        },
     }
     return save_experiment(rows, predictions, metadata, outdir)
 
@@ -216,7 +238,7 @@ def run_telecomts_experiment(
     seed: int = 17,
     offline: bool = True,
     verify_snapshot: bool = True,
-    transport: str = "rows_api"
+    learnable_gate: bool = False,
 ) -> pd.DataFrame:
     expected_hash = (
         PAPER_CACHE_SHA256
@@ -230,7 +252,6 @@ def run_telecomts_experiment(
         sampling=sampling,
         allow_download=not offline,
         expected_sha256=expected_hash,
-        transport=transport,
     )
     train_ix, val_ix, test_ix = random_split(len(bundle.x), seed=seed)
     x_train, x_val, x_test = (
@@ -252,15 +273,18 @@ def run_telecomts_experiment(
     models: list[BaseModel] = [
         PersistenceBaseline().fit(x_train, yl_train, yv_train),
         RidgeBaseline(alpha=35.0).fit(x_train, yl_train, yv_train),
-        # The paper fixes the standalone MLP initialization at seed 17.
+        # Unified seed policy: every stochastic component of every model in
+        # a run shares the same single seed (the run's --seed), rather than
+        # each sub-model picking its own fixed value. Multi-seed robustness
+        # sweeps still vary this one seed across runs (see run_multiseed.py).
         TemporalMLP(
             hidden=96,
             lr=0.012,
             epochs=160,
-            seed=17,
+            seed=seed,
         ).fit(x_train, yl_train, yv_train),
     ]
-    graph_model, validation = tune_stwingnn(
+    graph_model, validation = tune_mp_graph(
         graph=bundle.graph,
         x_train=x_train,
         y_lat_train=yl_train,
@@ -269,17 +293,16 @@ def run_telecomts_experiment(
         y_lat_val=yl_val,
         y_vio_val=yv_val,
         metric_fn=combined_metrics,
+        seed=seed,
+        learnable_gate=learnable_gate,
     )
-    models.extend(
-        [
-            graph_model,
-            HybridDigitalTwin(
-                graph=bundle.graph,
-                ridge_alpha=35.0,
-                mlp_seed=seed,
-            ).fit(x_train, yl_train, yv_train),
-        ]
-    )
+    hybrid_model = HybridDigitalTwin(
+        graph=bundle.graph,
+        ridge_alpha=35.0,
+        seed=seed,
+        learnable_gate=learnable_gate,
+    ).fit(x_train, yl_train, yv_train, x_val=x_val, y_latency_val=yl_val, y_violation_val=yv_val)
+    models.extend([graph_model, hybrid_model])
 
     rows: list[dict] = []
     predictions: dict[str, np.ndarray] = {
@@ -314,7 +337,15 @@ def run_telecomts_experiment(
             "test": float(yv_test.mean()),
         },
         "graph_model_best_validation": validation,
-        "standalone_mlp_seed": 17,
-        "hybrid_mlp_seed": seed,
+        "seed": seed,
+        "seed_policy": "single unified seed drives data split, MP-Graph "
+        "random features, and every model's weight initialization",
+        "learnable_gate": learnable_gate,
+        "fitted_gates": {
+            "mp_graph_gate_vio": graph_model.gate_vio,
+            "hybrid_dt_gate_latency": hybrid_model.gate_latency,
+            "hybrid_dt_gate_violation": hybrid_model.gate_violation,
+            "hybrid_dt_internal_gate_vio": hybrid_model.graph_head.gate_vio,
+        },
     }
     return save_experiment(rows, predictions, metadata, outdir)

@@ -57,6 +57,48 @@ def ridge_predict(x: np.ndarray, w: np.ndarray) -> np.ndarray:
     return x_aug @ w
 
 
+def fit_linear_gate(pred_a: np.ndarray, pred_b: np.ndarray, target: np.ndarray) -> float:
+    """Closed-form optimal convex-combination weight for two point predictors.
+
+    Solves min_g ||target - (g*pred_a + (1-g)*pred_b)||^2 for a single scalar
+    g, i.e. the same normal-equations style closed form used by ridge_fit
+    elsewhere in this file (no gradient descent), then clips to [0, 1] so the
+    result stays a genuine convex combination.
+    """
+    diff = (pred_a - pred_b).ravel()
+    denom = float(np.sum(diff * diff))
+    if denom < 1e-12:
+        return 0.5
+    gate = float(np.sum((target.ravel() - pred_b.ravel()) * diff) / denom)
+    return float(np.clip(gate, 0.0, 1.0))
+
+
+def fit_probability_gate(prob_a: np.ndarray, prob_b: np.ndarray, target: np.ndarray, steps: int = 101) -> float:
+    """Grid-searched optimal convex-combination weight for two probabilities.
+
+    F1 after thresholding at 0.5 is not differentiable in the blend weight,
+    so this scans a fixed, deterministic grid over [0, 1] and keeps the
+    weight with the best F1 on the data it is given (no RNG involved).
+    """
+    prob_a = prob_a.ravel()
+    prob_b = prob_b.ravel()
+    target = target.ravel()
+    best_gate, best_f1 = 0.5, -1.0
+    for gate in np.linspace(0.0, 1.0, steps):
+        blended = gate * prob_a + (1.0 - gate) * prob_b
+        pred_label = (blended >= 0.5).astype(float)
+        tp = float(np.sum((pred_label == 1) & (target == 1)))
+        fp = float(np.sum((pred_label == 1) & (target == 0)))
+        fn = float(np.sum((pred_label == 0) & (target == 1)))
+        precision = tp / max(tp + fp, 1e-9)
+        recall = tp / max(tp + fn, 1e-9)
+        f1 = 2 * precision * recall / max(precision + recall, 1e-9)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_gate = float(gate)
+    return best_gate
+
+
 @dataclass
 class Prediction:
     latency: np.ndarray
@@ -177,8 +219,15 @@ class TemporalMLP(BaseModel):
         return Prediction(latency=np.maximum(out[:, :3] * 100.0, 0.0), violation=sigmoid(out[:, 3:]))
 
 
-class STwinGNNLite(BaseModel):
-    name = "s_twingnn_lite"
+class MPGraph(BaseModel):
+    """Multi-plane graph feature encoder with fixed (non-learned) diffusion.
+
+    Note: this is a transparent diffusion + ridge model, not an end-to-end
+    trained GNN. The class name intentionally avoids "GNN" to match how it
+    is described in the paper.
+    """
+
+    name = "mp_graph"
 
     def __init__(
         self,
@@ -192,6 +241,8 @@ class STwinGNNLite(BaseModel):
         slice_indices=(8, 9, 10),
         sla=(45.0, 12.0, 80.0),
         residual_scale: float = 0.65,
+        learnable_gate: bool = False,
+        gate_vio: float = 0.35,
     ):
         self.graph = graph
         self.alpha = alpha
@@ -204,6 +255,12 @@ class STwinGNNLite(BaseModel):
         self.sla = np.asarray(sla)
         self.residual_scale = residual_scale
         self.scaler = Standardizer()
+        # Internal violation sub-fusion gate: vio = gate_vio*learned_vio +
+        # (1-gate_vio)*sla_vio. Fixed at 0.35 by default to reproduce the
+        # paper's original behavior; set learnable_gate=True to fit it from
+        # the training data instead (see fit()).
+        self.learnable_gate = learnable_gate
+        self.gate_vio = gate_vio
 
     def _diffuse(self, x_t: np.ndarray, adj: np.ndarray) -> np.ndarray:
         h = x_t
@@ -261,7 +318,15 @@ class STwinGNNLite(BaseModel):
         )
         return feats
 
-    def fit(self, x: np.ndarray, y_latency: np.ndarray, y_violation: np.ndarray) -> "STwinGNNLite":
+    def fit(
+        self,
+        x: np.ndarray,
+        y_latency: np.ndarray,
+        y_violation: np.ndarray,
+        x_val: Optional[np.ndarray] = None,
+        y_latency_val: Optional[np.ndarray] = None,
+        y_violation_val: Optional[np.ndarray] = None,
+    ) -> "MPGraph":
         rng = np.random.default_rng(self.seed)
         feats = self.scaler.fit_transform(self._features(x))
         if self.random_dim > 0:
@@ -278,24 +343,43 @@ class STwinGNNLite(BaseModel):
         self.residual_clip = np.quantile(np.abs(residual), 0.90, axis=0) + 1e-6
         self.w_latency = ridge_fit(z, residual, self.alpha)
         self.w_violation = ridge_fit(z, y_violation, self.alpha)
+
+        if self.learnable_gate:
+            # Fit gate_vio on held-out validation predictions when available.
+            # Fitting it on the same rows used to fit w_latency/w_violation
+            # (in-sample) is biased: a component that overfits the training
+            # rows looks artificially strong, so the gate would systematically
+            # favor whichever branch memorizes training data hardest instead
+            # of whichever generalizes best. Falls back to in-sample fitting
+            # only if no validation split is supplied.
+            if x_val is not None:
+                gate_x, gate_y_vio = x_val, y_violation_val
+            else:
+                gate_x, gate_y_vio = x, y_violation
+            pred = self.predict(gate_x)  # uses the pre-fit gate_vio default; only .latency is used below
+            learned_vio = sigmoid(ridge_predict(self._encode(gate_x), self.w_violation))
+            sla_vio = sigmoid((pred.latency - self.sla) / np.maximum(self.sla * 0.07, 0.8))
+            self.gate_vio = fit_probability_gate(learned_vio, sla_vio, gate_y_vio)
         return self
 
-    def predict(self, x: np.ndarray) -> Prediction:
+    def _encode(self, x: np.ndarray) -> np.ndarray:
         feats = self.scaler.transform(self._features(x))
         if self.random_w is None:
-            z = feats
-        else:
-            z = np.concatenate([feats, np.cos(feats @ self.random_w + self.random_b)], axis=1)
+            return feats
+        return np.concatenate([feats, np.cos(feats @ self.random_w + self.random_b)], axis=1)
+
+    def predict(self, x: np.ndarray) -> Prediction:
+        z = self._encode(x)
         base_latency = x[:, -1, self.slice_indices, 5]
         residual = np.clip(ridge_predict(z, self.w_latency), -self.residual_clip, self.residual_clip)
         lat = np.maximum(base_latency + self.residual_scale * residual, 0.0)
         learned_vio = sigmoid(ridge_predict(z, self.w_violation))
         sla_vio = sigmoid((lat - self.sla) / np.maximum(self.sla * 0.07, 0.8))
-        vio = 0.35 * learned_vio + 0.65 * sla_vio
+        vio = self.gate_vio * learned_vio + (1.0 - self.gate_vio) * sla_vio
         return Prediction(latency=lat, violation=vio)
 
 
-def tune_stwingnn(
+def tune_mp_graph(
     graph: Dict[str, np.ndarray],
     x_train: np.ndarray,
     y_lat_train: np.ndarray,
@@ -304,8 +388,10 @@ def tune_stwingnn(
     y_lat_val: np.ndarray,
     y_vio_val: np.ndarray,
     metric_fn,
-) -> Tuple[STwinGNNLite, dict]:
-    best_model: Optional[STwinGNNLite] = None
+    seed: int = 11,
+    learnable_gate: bool = False,
+) -> Tuple[MPGraph, dict]:
+    best_model: Optional[MPGraph] = None
     best_score = float("inf")
     best_metrics = {}
     grid = [
@@ -317,7 +403,10 @@ def tune_stwingnn(
         {"alpha": 30.0, "diffusion_steps": 3, "random_dim": 128, "temporal_decay": 0.90, "queue_weight": 1.4, "residual_scale": 0.35},
     ]
     for params in grid:
-        model = STwinGNNLite(graph=graph, **params).fit(x_train, y_lat_train, y_vio_train)
+        model = MPGraph(graph=graph, seed=seed, learnable_gate=learnable_gate, **params).fit(
+            x_train, y_lat_train, y_vio_train,
+            x_val=x_val, y_latency_val=y_lat_val, y_violation_val=y_vio_val,
+        )
         pred = model.predict(x_val)
         metrics = metric_fn(y_lat_val, pred.latency, y_vio_val, pred.violation)
         score = metrics["latency_mae"] - 6.0 * metrics["violation_f1"]
@@ -332,8 +421,27 @@ def tune_stwingnn(
 class HybridDigitalTwin(BaseModel):
     name = "hybrid_dt"
 
-    def __init__(self, graph: Dict[str, np.ndarray], ridge_alpha: float = 35.0, mlp_seed: int = 17):
-        self.graph_head = STwinGNNLite(
+    def __init__(
+        self,
+        graph: Dict[str, np.ndarray],
+        ridge_alpha: float = 35.0,
+        seed: int = 17,
+        learnable_gate: bool = False,
+        gate_latency: float = 0.25,
+        gate_violation: float = 0.15,
+    ):
+        # Single unified seed drives every stochastic component of this
+        # model (the graph head's random features and the violation MLP's
+        # weight init), instead of each sub-model picking its own seed.
+        self.seed = seed
+        self.learnable_gate = learnable_gate
+        # gate_latency (eta) blends graph_head vs. ridge latency; gate_violation
+        # (beta) blends graph_head vs. MLP violation probability. Fixed at
+        # 0.25 / 0.15 by default to reproduce the paper's original behavior;
+        # set learnable_gate=True to fit both from training data instead.
+        self.gate_latency = gate_latency
+        self.gate_violation = gate_violation
+        self.graph_head = MPGraph(
             graph=graph,
             alpha=ridge_alpha,
             diffusion_steps=2,
@@ -341,20 +449,50 @@ class HybridDigitalTwin(BaseModel):
             temporal_decay=0.88,
             queue_weight=1.2,
             residual_scale=0.65,
+            seed=seed,
+            learnable_gate=learnable_gate,
         )
         self.latency_fallback = RidgeBaseline(alpha=ridge_alpha)
-        self.violation_head = TemporalMLP(hidden=96, lr=0.012, epochs=180, seed=mlp_seed)
+        self.violation_head = TemporalMLP(hidden=96, lr=0.012, epochs=180, seed=seed)
 
-    def fit(self, x: np.ndarray, y_latency: np.ndarray, y_violation: np.ndarray) -> "HybridDigitalTwin":
-        self.graph_head.fit(x, y_latency, y_violation)
+    def fit(
+        self,
+        x: np.ndarray,
+        y_latency: np.ndarray,
+        y_violation: np.ndarray,
+        x_val: Optional[np.ndarray] = None,
+        y_latency_val: Optional[np.ndarray] = None,
+        y_violation_val: Optional[np.ndarray] = None,
+    ) -> "HybridDigitalTwin":
+        self.graph_head.fit(
+            x, y_latency, y_violation,
+            x_val=x_val, y_latency_val=y_latency_val, y_violation_val=y_violation_val,
+        )
         self.latency_fallback.fit(x, y_latency, y_violation)
         self.violation_head.fit(x, y_latency, y_violation)
+
+        if self.learnable_gate:
+            # Fit the two top-level fusion scalars on held-out validation
+            # predictions when available (same reasoning as MPGraph's
+            # internal gate: fitting on training rows would bias the gate
+            # toward whichever sub-model overfits training data hardest,
+            # e.g. Ridge-flat's very high-dimensional feature set). Falls
+            # back to in-sample fitting only if no validation split is given.
+            if x_val is not None:
+                gate_x, gate_y_lat, gate_y_vio = x_val, y_latency_val, y_violation_val
+            else:
+                gate_x, gate_y_lat, gate_y_vio = x, y_latency, y_violation
+            graph_pred = self.graph_head.predict(gate_x)
+            ridge_pred = self.latency_fallback.predict(gate_x)
+            mlp_pred = self.violation_head.predict(gate_x)
+            self.gate_latency = fit_linear_gate(graph_pred.latency, ridge_pred.latency, gate_y_lat)
+            self.gate_violation = fit_probability_gate(graph_pred.violation, mlp_pred.violation, gate_y_vio)
         return self
 
     def predict(self, x: np.ndarray) -> Prediction:
         graph_pred = self.graph_head.predict(x)
         ridge_pred = self.latency_fallback.predict(x)
         mlp_pred = self.violation_head.predict(x)
-        latency = 0.25 * graph_pred.latency + 0.75 * ridge_pred.latency
-        violation = 0.15 * graph_pred.violation + 0.85 * mlp_pred.violation
+        latency = self.gate_latency * graph_pred.latency + (1.0 - self.gate_latency) * ridge_pred.latency
+        violation = self.gate_violation * graph_pred.violation + (1.0 - self.gate_violation) * mlp_pred.violation
         return Prediction(latency=latency, violation=violation)

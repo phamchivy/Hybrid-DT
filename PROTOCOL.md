@@ -44,7 +44,7 @@ partitions, not temporal or site-level generalization.
   deviation features.
 - **Temporal-MLP** is a one-hidden-layer NumPy model over recent, mean, and
   trend features.
-- **MP-Graph** (`s_twingnn_lite` in code) applies fixed multi-plane graph
+- **MP-Graph** (`mp_graph` in code) applies fixed multi-plane graph
   diffusion, temporal weighting, queueing features, and residual ridge heads.
 - **Hybrid-DT** fuses 25% MP-Graph with 75% Ridge-flat for latency, and 15%
   MP-Graph with 85% Temporal-MLP for violation risk.
@@ -67,10 +67,15 @@ arithmetic mean and sample standard deviation (`ddof=1`).
 ## 5. Determinism
 
 - dataset snapshot: SHA-256 pinned;
-- controlled generator: NumPy `default_rng(7)`;
-- graph random features: NumPy `default_rng(11)`;
-- standalone TelecomTS MLP: initialization seed 17;
-- Hybrid-DT MLP: initialization follows the row-split seed;
+- a single `--seed` drives every stochastic component of a run: the
+  controlled generator, the TelecomTS row split, MP-Graph's random
+  features, and every model's weight initialization (standalone
+  Temporal-MLP and Hybrid-DT's internal MLP alike). Earlier releases let
+  these drift independently (fixed at 7/11/17), which silently kept the
+  standalone Temporal-MLP baseline's initialization pinned at seed 17 even
+  during the multi-seed sweep; this is now fixed;
+- multi-seed robustness sweeps vary this one seed across runs
+  (`run_multiseed.py`, default seeds 7/11/17/23/29);
 - dependencies: exact NumPy and Pandas versions in `requirements.txt`.
 
 Linear algebra libraries may differ in low-order floating-point bits across

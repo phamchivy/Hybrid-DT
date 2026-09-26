@@ -82,6 +82,7 @@ saved below `outputs/`.
 | Experiment | Model | Latency MAE | Violation F1 |
 |---|---|---:|---:|
 | Controlled, seed 7 | MP-Graph | 1.1948 | 0.9899 |
+| Controlled, seed 7 | Hybrid-DT | 1.2572 | 0.9265 |
 | TelecomTS, seed 17 | Hybrid-DT | 0.6963 | 0.9686 |
 | TelecomTS, five seeds | Hybrid-DT | 0.7698 +/- 0.0420 | 0.9504 +/- 0.0198 |
 
@@ -107,8 +108,12 @@ data/                          exact compressed TelecomTS subset and manifest
 tests/                         deterministic unit and data-integrity tests
 ```
 
-The paper calls `s_twingnn_lite` **MP-Graph**. `hybrid_dt` combines MP-Graph
-with the Ridge-flat latency head and Temporal-MLP violation head.
+The code names this model **MP-Graph** directly (`mp_graph`), matching how
+it is described in the paper: a transparent, fixed multi-plane diffusion +
+ridge model, not an end-to-end trained GNN. `hybrid_dt` combines MP-Graph
+with the Ridge-flat latency head and Temporal-MLP violation head. Both the
+controlled (synthetic) and TelecomTS benchmarks now evaluate Hybrid-DT
+alongside MP-Graph.
 
 ## Data Provenance
 
