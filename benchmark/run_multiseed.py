@@ -40,6 +40,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--download", action="store_true")
     parser.add_argument("--skip-checksum", action="store_true")
+
+    parser.add_argument("--transport", choices=["rows_api", "datasets"], default="rows_api")
+
     return parser.parse_args()
 
 
@@ -77,6 +80,7 @@ def main() -> None:
             seed=seed,
             offline=not args.download,
             verify_snapshot=not args.skip_checksum,
+            transport=args.transport,
         )
         frame["seed"] = seed
         frames.append(frame)

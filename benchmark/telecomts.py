@@ -38,21 +38,23 @@ def _read_rows(path: Path) -> List[dict]:
 
 def _write_rows(path: Path, rows: List[dict]) -> None:
     """Write only the fields used by the benchmark, deterministically."""
-    payload = "".join(
-        json.dumps(
-            {"KPIs": row["KPIs"], "labels": row["labels"]},
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        + "\n"
-        for row in rows
-    ).encode("utf-8")
+    def _lines():
+        for row in rows:
+            yield json.dumps(
+                {"KPIs": row["KPIs"], "labels": row["labels"]},
+                separators=(",", ":"),
+                sort_keys=True,
+            ) + "\n"
+
     if path.suffix == ".gz":
         with path.open("wb") as raw:
-            with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as stream:
-                stream.write(payload)
+            with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as gz:
+                for line in _lines():
+                    gz.write(line.encode("utf-8"))
     else:
-        path.write_bytes(payload)
+        with path.open("w", encoding="utf-8") as stream:
+            for line in _lines():
+                stream.write(line)
 
 
 def fetch_telecomts_rows(
@@ -63,6 +65,7 @@ def fetch_telecomts_rows(
     sampling: str = "even",
     allow_download: bool = True,
     expected_sha256: str | None = None,
+    transport: str = "rows_api",   # <-- thêm
 ) -> List[dict]:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     rows: List[dict] = []
@@ -82,6 +85,17 @@ def fetch_telecomts_rows(
             f"Need {samples} TelecomTS rows at {cache_path}; "
             "download is disabled."
         )
+
+    if transport == "datasets":            # <-- thêm nhánh mới
+        rows = _fetch_via_datasets_lib(samples, split, sampling)
+        if len(rows) < samples:
+            raise RuntimeError(f"Downloaded only {len(rows)} of {samples} requested rows")
+        _write_rows(cache_path, rows[:samples])
+        if expected_sha256 is not None:
+            actual = sha256_file(cache_path)
+            if actual != expected_sha256:
+                raise ValueError(f"Checksum mismatch: expected {expected_sha256}, got {actual}")
+        return rows[:samples]
 
     def read_page(offset: int, length: int) -> tuple[List[dict], int]:
         params = urllib.parse.urlencode(
@@ -268,6 +282,7 @@ def load_telecomts_bundle(
     sampling: str = "even",
     allow_download: bool = True,
     expected_sha256: str | None = None,
+    transport: str = "rows_api",   # <-- thêm
 ) -> DatasetBundle:
     rows = fetch_telecomts_rows(
         cache_path=cache_path,
@@ -275,6 +290,7 @@ def load_telecomts_bundle(
         sampling=sampling,
         allow_download=allow_download,
         expected_sha256=expected_sha256,
+        transport=transport,
     )
     xs, y_lat, y_vio = [], [], []
     for row in rows:
@@ -306,3 +322,25 @@ def load_telecomts_bundle(
         graph=build_5gc_graph(),
         metadata=metadata,
     )
+
+def _fetch_via_datasets_lib(
+    samples: int,
+    split: str,
+    sampling: str,
+) -> List[dict]:
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise RuntimeError(
+            "Cần cài package 'datasets': pip install datasets huggingface_hub"
+        ) from exc
+
+    ds = load_dataset(DATASET_ID, split=split)
+    total = len(ds)
+    if sampling == "even":
+        n = min(samples, total)
+        idx = np.linspace(0, total - 1, n, dtype=int).tolist()
+    else:
+        idx = list(range(min(samples, total)))
+    subset = ds.select(idx)
+    return [{"KPIs": r["KPIs"], "labels": r["labels"]} for r in subset]

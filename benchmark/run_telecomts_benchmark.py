@@ -38,6 +38,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow a cache other than the paper's exact 800-row snapshot.",
     )
+
+    parser.add_argument("--transport", choices=["rows_api", "datasets"], default="rows_api")
+
     return parser.parse_args()
 
 
@@ -52,6 +55,7 @@ def main() -> None:
         seed=args.seed,
         offline=not args.download,
         verify_snapshot=not args.skip_checksum,
+        transport=args.transport,
     )
     print(frame.to_string(index=False))
     print(f"\nArtifacts: {args.outdir.resolve()}")

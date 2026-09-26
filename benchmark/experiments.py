@@ -216,6 +216,7 @@ def run_telecomts_experiment(
     seed: int = 17,
     offline: bool = True,
     verify_snapshot: bool = True,
+    transport: str = "rows_api"
 ) -> pd.DataFrame:
     expected_hash = (
         PAPER_CACHE_SHA256
@@ -229,6 +230,7 @@ def run_telecomts_experiment(
         sampling=sampling,
         allow_download=not offline,
         expected_sha256=expected_hash,
+        transport=transport,
     )
     train_ix, val_ix, test_ix = random_split(len(bundle.x), seed=seed)
     x_train, x_val, x_test = (
