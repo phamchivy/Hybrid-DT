@@ -62,6 +62,19 @@ def parse_args() -> argparse.Namespace:
         help="Fit the fusion gates (MP-Graph internal, Hybrid-DT latency/violation) "
         "from training data instead of using the paper's fixed weights.",
     )
+    parser.add_argument(
+        "--no-queue-features",
+        dest="use_queue_features",
+        action="store_false",
+        help="Ablation: drop MP-Graph's queueing-theory utilization/delay "
+        "features entirely (default: included, matching the paper).",
+    )
+    parser.add_argument(
+        "--single-plane-graph",
+        action="store_true",
+        help="Ablation: collapse the 3 control/user/slice graph planes into "
+        "MP-Graph's single 'all' plane (default: multi-plane, matching the paper).",
+    )
     return parser.parse_args()
 
 
@@ -99,6 +112,8 @@ def main() -> None:
                 horizon=args.horizon,
                 seed=seed,
                 learnable_gate=args.learnable_gate,
+                use_queue_features=args.use_queue_features,
+                single_plane_graph=args.single_plane_graph,
             )
         else:
             frame = run_telecomts_experiment(
@@ -110,6 +125,8 @@ def main() -> None:
                 offline=not args.download,
                 verify_snapshot=not args.skip_checksum,
                 learnable_gate=args.learnable_gate,
+                use_queue_features=args.use_queue_features,
+                single_plane_graph=args.single_plane_graph,
             )
         frame["seed"] = seed
         frames.append(frame)
@@ -136,6 +153,8 @@ def main() -> None:
                 "window": args.window if args.dataset == "controlled" else None,
                 "horizon": args.horizon if args.dataset == "controlled" else None,
                 "learnable_gate": args.learnable_gate,
+                "use_queue_features": args.use_queue_features,
+                "single_plane_graph": args.single_plane_graph,
                 "std": "sample standard deviation (pandas ddof=1)",
             },
             indent=2,

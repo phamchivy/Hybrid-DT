@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Runs the two five-seed robustness sweeps this repo defines -- controlled
-# (synthetic) and TelecomTS -- each once with the paper's fixed fusion
-# weights and once with --learnable-gate. That is 4 independent, CPU-only
-# (numpy/pandas, no GPU) jobs, launched in parallel; each writes its own log
-# under logs/.
+# Runs, in parallel, every five-seed robustness sweep this repo defines:
+#   - controlled (synthetic) and TelecomTS, each with the paper's fixed
+#     fusion weights and with --learnable-gate (4 jobs)
+#   - 2 structural ablations (single-plane graph, no queue features), each
+#     on both datasets, fixed-gate only -- the ablations isolate MP-Graph's
+#     architecture, so they are not crossed with the gate ablation (4 jobs)
+# That is 8 independent, CPU-only (numpy/pandas, no GPU) jobs, launched in
+# parallel; each writes its own log under logs/.
 #
 # There is deliberately no separate single-seed run here: seed 7 (controlled)
 # and seed 17 (TelecomTS) are the paper's original single-split seeds, and
@@ -13,7 +16,7 @@
 set -uo pipefail
 
 # Each run below is independent; cap every process to a single BLAS thread so
-# 4 parallel jobs times numpy's own internal multi-threading doesn't
+# 8 parallel jobs times numpy's own internal multi-threading doesn't
 # oversubscribe the machine's cores.
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
@@ -74,6 +77,32 @@ launch telecomts_multiseed_learnable \
     --cache "$TELECOMTS_CACHE" --download --skip-checksum \
     --outdir outputs/telecomts_multiseed_learnable
 
+# --- Ablations, 5-seed sweep, fixed gate ---
+# Single-plane graph: collapse control/user/slice down to MP-Graph's "all"
+# plane (pure data substitution, no model code change).
+launch controlled_ablation_single_plane \
+  python -m benchmark.run_multiseed --dataset controlled \
+    --seeds $SEEDS --timesteps 1800 --window 12 --horizon 3 --single-plane-graph \
+    --outdir outputs/controlled_ablation_single_plane
+
+launch telecomts_ablation_single_plane \
+  python -m benchmark.run_multiseed --dataset telecomts \
+    --seeds $SEEDS --samples "$TELECOMTS_SAMPLES" --input-len 96 --single-plane-graph \
+    --cache "$TELECOMTS_CACHE" --download --skip-checksum \
+    --outdir outputs/telecomts_ablation_single_plane
+
+# No queue features: drop MP-Graph's queueing-theory utilization/delay block.
+launch controlled_ablation_no_queue \
+  python -m benchmark.run_multiseed --dataset controlled \
+    --seeds $SEEDS --timesteps 1800 --window 12 --horizon 3 --no-queue-features \
+    --outdir outputs/controlled_ablation_no_queue
+
+launch telecomts_ablation_no_queue \
+  python -m benchmark.run_multiseed --dataset telecomts \
+    --seeds $SEEDS --samples "$TELECOMTS_SAMPLES" --input-len 96 --no-queue-features \
+    --cache "$TELECOMTS_CACHE" --download --skip-checksum \
+    --outdir outputs/telecomts_ablation_no_queue
+
 fail=0
 for i in "${!pids[@]}"; do
   if ! wait "${pids[$i]}"; then
@@ -88,7 +117,7 @@ if [ "$fail" -ne 0 ]; then
 fi
 
 echo ""
-echo "All 4 runs finished."
+echo "All 8 runs finished."
 echo ""
 echo "Note: benchmark.verify_results checks against artifacts/expected/*.csv,"
 echo "which are pinned to the paper's original 800-row TelecomTS snapshot and"
@@ -146,4 +175,22 @@ for label, fixed_path, learnable_path in [
             index=["hybrid_dt"],
         ).to_string()
     )
+
+print("\n=== Ablations (fixed gate, 5-seed mean): MP-Graph vs. full model ===")
+ablation_pairs = [
+    ("Controlled", "outputs/controlled_multiseed/summary.csv",
+     "single-plane graph", "outputs/controlled_ablation_single_plane/summary.csv",
+     "no queue features", "outputs/controlled_ablation_no_queue/summary.csv"),
+    ("TelecomTS", "outputs/telecomts_multiseed/summary.csv",
+     "single-plane graph", "outputs/telecomts_ablation_single_plane/summary.csv",
+     "no queue features", "outputs/telecomts_ablation_no_queue/summary.csv"),
+]
+for label, full_path, name_a, path_a, name_b, path_b in ablation_pairs:
+    full = pd.read_csv(full_path).set_index("model")
+    rows = [{"variant": "full (paper)", "latency_mae_mean": full.loc["mp_graph", "latency_mae_mean"], "violation_f1_mean": full.loc["mp_graph", "violation_f1_mean"]}]
+    for name, path in [(name_a, path_a), (name_b, path_b)]:
+        ablated = pd.read_csv(path).set_index("model")
+        rows.append({"variant": name, "latency_mae_mean": ablated.loc["mp_graph", "latency_mae_mean"], "violation_f1_mean": ablated.loc["mp_graph", "violation_f1_mean"]})
+    print(f"\n-- {label}, MP-Graph --")
+    print(pd.DataFrame(rows).to_string(index=False))
 PY

@@ -133,6 +133,8 @@ def run_controlled_experiment(
     seed: int = 7,
     quick: bool = False,
     learnable_gate: bool = False,
+    use_queue_features: bool = True,
+    single_plane_graph: bool = False,
 ) -> pd.DataFrame:
     if quick:
         timesteps = min(timesteps, 650)
@@ -142,6 +144,12 @@ def run_controlled_experiment(
         horizon=horizon,
         seed=seed,
     )
+    graph = bundle.graph
+    if single_plane_graph:
+        # Ablation: collapse the 3 control/user/slice planes down to the
+        # single "all" plane MPGraph already builds, instead of multi-plane
+        # diffusion. Pure data substitution -- no model code changes needed.
+        graph = {**graph, "control": graph["all"], "user": graph["all"], "slice": graph["all"]}
     train_sl, val_sl, test_sl = train_val_test_split(len(bundle.x))
     x_train, x_val, x_test = (
         bundle.x[train_sl],
@@ -170,7 +178,7 @@ def run_controlled_experiment(
         ).fit(x_train, yl_train, yv_train),
     ]
     graph_model, validation = tune_mp_graph(
-        graph=bundle.graph,
+        graph=graph,
         x_train=x_train,
         y_lat_train=yl_train,
         y_vio_train=yv_train,
@@ -180,6 +188,7 @@ def run_controlled_experiment(
         metric_fn=combined_metrics,
         seed=seed,
         learnable_gate=learnable_gate,
+        use_queue_features=use_queue_features,
     )
     models.append(graph_model)
     # Reuse the exact tuned graph_model as Hybrid-DT's graph_head instead of
@@ -223,6 +232,8 @@ def run_controlled_experiment(
         "graph_model_best_validation": validation,
         "quick": quick,
         "learnable_gate": learnable_gate,
+        "use_queue_features": use_queue_features,
+        "single_plane_graph": single_plane_graph,
         "fitted_gates": {
             # mp_graph_gate_vio is shared: Hybrid-DT reuses the exact same
             # tuned graph_model as its graph_head (see comment above), so
@@ -245,6 +256,8 @@ def run_telecomts_experiment(
     offline: bool = True,
     verify_snapshot: bool = True,
     learnable_gate: bool = False,
+    use_queue_features: bool = True,
+    single_plane_graph: bool = False,
 ) -> pd.DataFrame:
     expected_hash = (
         PAPER_CACHE_SHA256
@@ -259,6 +272,11 @@ def run_telecomts_experiment(
         allow_download=not offline,
         expected_sha256=expected_hash,
     )
+    graph = bundle.graph
+    if single_plane_graph:
+        # Ablation: collapse the 3 control/user/slice planes down to the
+        # single "all" plane (see comment in run_controlled_experiment).
+        graph = {**graph, "control": graph["all"], "user": graph["all"], "slice": graph["all"]}
     train_ix, val_ix, test_ix = random_split(len(bundle.x), seed=seed)
     x_train, x_val, x_test = (
         bundle.x[train_ix],
@@ -291,7 +309,7 @@ def run_telecomts_experiment(
         ).fit(x_train, yl_train, yv_train),
     ]
     graph_model, validation = tune_mp_graph(
-        graph=bundle.graph,
+        graph=graph,
         x_train=x_train,
         y_lat_train=yl_train,
         y_vio_train=yv_train,
@@ -301,6 +319,7 @@ def run_telecomts_experiment(
         metric_fn=combined_metrics,
         seed=seed,
         learnable_gate=learnable_gate,
+        use_queue_features=use_queue_features,
     )
     # Reuse the exact tuned graph_model as Hybrid-DT's graph_head instead of
     # building a second MPGraph with untuned hyperparameters (see comment in
@@ -350,6 +369,8 @@ def run_telecomts_experiment(
         "seed_policy": "single unified seed drives data split, MP-Graph "
         "random features, and every model's weight initialization",
         "learnable_gate": learnable_gate,
+        "use_queue_features": use_queue_features,
+        "single_plane_graph": single_plane_graph,
         "fitted_gates": {
             # mp_graph_gate_vio is shared: Hybrid-DT reuses the exact same
             # tuned graph_model as its graph_head (see comment above), so

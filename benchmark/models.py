@@ -155,11 +155,26 @@ class RidgeBaseline(BaseModel):
         feats = self.scaler.fit_transform(self._features(x))
         self.w_latency = ridge_fit(feats, y_latency, self.alpha)
         self.w_violation = ridge_fit(feats, y_violation, self.alpha)
+
+        # Guard against the closed-form ridge solve producing a few wildly
+        # extreme predictions on ill-conditioned high-dimensional splits
+        # (observed on TelecomTS at larger sample counts: RMSE spiking to
+        # 10-30x the usual value on specific seeds while MAE barely moves,
+        # meaning a handful of outlier predictions, not a systematic error).
+        # The clip range is derived only from training predictions and
+        # training targets -- never from validation or test -- so this is a
+        # model-fitting choice, not test-set leakage.
+        train_pred = ridge_predict(feats, self.w_latency)
+        lo = np.minimum(y_latency.min(axis=0), train_pred.min(axis=0))
+        hi = np.maximum(y_latency.max(axis=0), train_pred.max(axis=0))
+        margin = np.maximum(hi - lo, 1e-6)
+        self.latency_clip = (lo - 0.5 * margin, hi + 0.5 * margin)
         return self
 
     def predict(self, x: np.ndarray) -> Prediction:
         feats = self.scaler.transform(self._features(x))
         lat = ridge_predict(feats, self.w_latency)
+        lat = np.clip(lat, self.latency_clip[0], self.latency_clip[1])
         vio = sigmoid(ridge_predict(feats, self.w_violation))
         return Prediction(latency=lat, violation=vio)
 
@@ -243,6 +258,7 @@ class MPGraph(BaseModel):
         residual_scale: float = 0.65,
         learnable_gate: bool = False,
         gate_vio: float = 0.35,
+        use_queue_features: bool = True,
     ):
         self.graph = graph
         self.alpha = alpha
@@ -255,6 +271,10 @@ class MPGraph(BaseModel):
         self.sla = np.asarray(sla)
         self.residual_scale = residual_scale
         self.scaler = Standardizer()
+        # Ablation switch: drop the queueing-theory-derived utilization/delay
+        # features entirely (rather than just their weight) to measure their
+        # contribution. True by default to match the paper's reported model.
+        self.use_queue_features = use_queue_features
         # Internal violation sub-fusion gate: vio = gate_vio*learned_vio +
         # (1-gate_vio)*sla_vio. Fixed at 0.35 by default to reproduce the
         # paper's original behavior; set learnable_gate=True to fit it from
@@ -288,7 +308,8 @@ class MPGraph(BaseModel):
         user = self._diffuse(x_att, self.graph["user"])
         slice_g = self._diffuse(x_att, self.graph["slice"])
         all_g = self._diffuse(x_last, self.graph["all"])
-        queue = self._queue_features(x[:, -4:]).mean(axis=1)
+        if self.use_queue_features:
+            queue = self._queue_features(x[:, -4:]).mean(axis=1)
         recent_raw = x[:, -4:].reshape(len(x), -1)
         last_raw = x[:, -1].reshape(len(x), -1)
         mean_raw = x.mean(axis=1).reshape(len(x), -1)
@@ -298,24 +319,23 @@ class MPGraph(BaseModel):
 
         cross_plane = control * user
         trend_slice = self._diffuse(x_trend, self.graph["slice"])
-        feats = np.concatenate(
-            [
-                recent_raw,
-                last_raw,
-                mean_raw,
-                std_raw,
-                slice_last,
-                slice_trend,
-                control.reshape(len(x), -1),
-                user.reshape(len(x), -1),
-                slice_g.reshape(len(x), -1),
-                all_g.reshape(len(x), -1),
-                cross_plane.reshape(len(x), -1),
-                trend_slice.reshape(len(x), -1),
-                queue.reshape(len(x), -1),
-            ],
-            axis=1,
-        )
+        parts = [
+            recent_raw,
+            last_raw,
+            mean_raw,
+            std_raw,
+            slice_last,
+            slice_trend,
+            control.reshape(len(x), -1),
+            user.reshape(len(x), -1),
+            slice_g.reshape(len(x), -1),
+            all_g.reshape(len(x), -1),
+            cross_plane.reshape(len(x), -1),
+            trend_slice.reshape(len(x), -1),
+        ]
+        if self.use_queue_features:
+            parts.append(queue.reshape(len(x), -1))
+        feats = np.concatenate(parts, axis=1)
         return feats
 
     def fit(
@@ -390,6 +410,7 @@ def tune_mp_graph(
     metric_fn,
     seed: int = 11,
     learnable_gate: bool = False,
+    use_queue_features: bool = True,
 ) -> Tuple[MPGraph, dict]:
     best_model: Optional[MPGraph] = None
     best_score = float("inf")
@@ -422,7 +443,13 @@ def tune_mp_graph(
         y_vio_gate, y_vio_select = y_vio_val, y_vio_val
 
     for params in grid:
-        model = MPGraph(graph=graph, seed=seed, learnable_gate=learnable_gate, **params).fit(
+        model = MPGraph(
+            graph=graph,
+            seed=seed,
+            learnable_gate=learnable_gate,
+            use_queue_features=use_queue_features,
+            **params,
+        ).fit(
             x_train, y_lat_train, y_vio_train,
             x_val=x_gate, y_latency_val=y_lat_gate, y_violation_val=y_vio_gate,
         )
